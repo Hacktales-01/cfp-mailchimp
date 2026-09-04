@@ -65,13 +65,43 @@ async function subscribe({ name, email, phone, tag }) {
       body: JSON.stringify({
         email_address: email,
         status_if_new: 'subscribed',
-        merge_fields: { FNAME: name || '', PHONE: phone || '' },
+        merge_fields: { FNAME: name || '', MMERGE2: phone || '' },
         tags: [memberTag]
       })
     });
     const data = await r.json();
     if (!r.ok) {
-      console.error('Mailchimp error:', r.status, data.title, data.detail);
+      // Mailchimp puts the exact offending field(s) in data.errors — log them.
+      console.error('Mailchimp error:', r.status, data.title, '|', data.detail);
+      if (Array.isArray(data.errors)) {
+        data.errors.forEach(e => console.error('  field:', e.field, '->', e.message));
+      }
+
+      // If the rejection is about a merge field (e.g. PHONE failing US-format
+      // validation for Nigerian numbers), retry WITHOUT merge fields so the
+      // subscriber + tag are still captured. Fix the field in Mailchimp to
+      // stop losing the phone number (see notes).
+      const isMergeIssue =
+        (data.title === 'Invalid Resource') &&
+        (Array.isArray(data.errors) ? data.errors.some(e => /merge|MMERGE2|FNAME/i.test(e.field || '')) : true);
+
+      if (isMergeIssue) {
+        const retry = await fetch(url, {
+          method: 'PUT',
+          headers: { 'Authorization': auth, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ email_address: email, status_if_new: 'subscribed', tags: [memberTag] })
+        });
+        if (retry.ok) {
+          await fetch(url + '/tags', {
+            method: 'POST',
+            headers: { 'Authorization': auth, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ tags: [{ name: memberTag, status: 'active' }] })
+          }).catch(() => {});
+          console.warn('Saved WITHOUT merge fields (phone/name dropped) — fix the PHONE field in Mailchimp. Email:', email);
+          return { status: 200, body: { ok: true, warning: 'saved without phone' } };
+        }
+      }
+
       return { status: 502, body: { ok: false, error: data.title || 'Mailchimp error' } };
     }
 
