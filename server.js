@@ -1,90 +1,140 @@
-// Hacktales CFP landing — static site + Mailchimp subscribe endpoint.
-// Secrets live in Render environment variables, never in this repo:
-//   MAILCHIMP_API_KEY      e.g. abc123...-us21   (Account -> Extras -> API keys)
-//   MAILCHIMP_AUDIENCE_ID  e.g. a1b2c3d4e5      (Audience -> Settings -> Audience name and defaults)
-const express = require('express');
+// ============================================================
+// Hacktales CFP API — Mailchimp only.
+// This service has ONE job: receive a subscriber and push it to
+// Mailchimp. It serves no HTML and knows nothing about the
+// landing page (that lives separately on cPanel).
+//
+// Requires only Node 18+ (built-in fetch & crypto). No npm deps.
+//
+// Render environment variables:
+//   MAILCHIMP_API_KEY      e.g.  abcd1234...-us21
+//   MAILCHIMP_AUDIENCE_ID  e.g.  a1b2c3d4e5
+// Optional:
+//   ALLOWED_ORIGINS        comma-separated list of the exact site origins
+//                          allowed to call this API, e.g.
+//                          https://hacktales.com,https://www.hacktales.com
+//                          (leave unset while testing = allow any origin)
+// ============================================================
+const http = require('http');
 const crypto = require('crypto');
-const path = require('path');
 
-const app = express();
-app.use(express.json());
-
-// ---- CORS: allow the cPanel-hosted frontend to call this API ----
-// Set ALLOWED_ORIGINS in Render env as a comma-separated list, e.g.:
-//   https://hacktales.com,https://www.hacktales.com,https://cfp.hacktales.com
-const allowed = (process.env.ALLOWED_ORIGINS || 'https://hacktales.com', 'https://www.hacktales.com')
+const ALLOWED_TAGS = ['cfp entry', 'stemlab cybersecurity'];
+const allowedOrigins = (process.env.ALLOWED_ORIGINS || '')
   .split(',').map(s => s.trim()).filter(Boolean);
 
-app.use((req, res, next) => {
-  const origin = req.headers.origin;
-  if (origin && (allowed.length === 0 || allowed.includes(origin))) {
-    res.setHeader('Access-Control-Allow-Origin', origin);
-    res.setHeader('Vary', 'Origin');
-    res.setHeader('Access-Control-Allow-Methods', 'POST, GET, OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+function corsHeaders(origin) {
+  const h = {
+    'Vary': 'Origin',
+    'Access-Control-Allow-Methods': 'POST, GET, OPTIONS',
+    'Access-Control-Allow-Headers': 'Content-Type'
+  };
+  if (origin && (allowedOrigins.length === 0 || allowedOrigins.includes(origin))) {
+    h['Access-Control-Allow-Origin'] = origin;
   }
-  if (req.method === 'OPTIONS') return res.sendStatus(204);
-  next();
-});
+  return h;
+}
 
-// Lightweight endpoint the frontend pings on page load to wake a sleeping
-// free-tier service before the visitor submits the form.
-app.get('/health', (req, res) => res.json({ ok: true }));
+function sendJSON(res, status, obj, origin) {
+  res.writeHead(status, { 'Content-Type': 'application/json', ...corsHeaders(origin) });
+  res.end(JSON.stringify(obj));
+}
 
-app.use(express.static(path.join(__dirname, 'public')));
+async function subscribe({ name, email, phone, tag }) {
+  const memberTag = ALLOWED_TAGS.includes(tag) ? tag : 'cfp entry';
 
-app.post('/api/subscribe', async (req, res) => {
-  const { name, email, phone } = req.body || {};
   if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
-    return res.status(400).json({ ok: false, error: 'Invalid email' });
+    return { status: 400, body: { ok: false, error: 'Invalid email' } };
   }
 
   const apiKey = process.env.MAILCHIMP_API_KEY;
   const listId = process.env.MAILCHIMP_AUDIENCE_ID;
   if (!apiKey || !listId) {
-    console.error('Mailchimp env vars missing');
-    return res.status(500).json({ ok: false, error: 'Server not configured' });
+    console.error('Missing MAILCHIMP_API_KEY or MAILCHIMP_AUDIENCE_ID');
+    return { status: 500, body: { ok: false, error: 'Server not configured' } };
   }
 
-  const dc = apiKey.split('-').pop();                       // datacenter from key suffix
+  const dc = apiKey.split('-').pop();
   const hash = crypto.createHash('md5').update(email.toLowerCase()).digest('hex');
   const url = `https://${dc}.api.mailchimp.com/3.0/lists/${listId}/members/${hash}`;
+  const auth = 'Basic ' + Buffer.from('anystring:' + apiKey).toString('base64');
 
   try {
     const r = await fetch(url, {
-      method: 'PUT',                                        // upsert: add or update
-      headers: {
-        'Authorization': 'Basic ' + Buffer.from('anystring:' + apiKey).toString('base64'),
-        'Content-Type': 'application/json'
-      },
+      method: 'PUT',
+      headers: { 'Authorization': auth, 'Content-Type': 'application/json' },
       body: JSON.stringify({
         email_address: email,
         status_if_new: 'subscribed',
         merge_fields: { FNAME: name || '', PHONE: phone || '' },
-        tags: ['cfp entry']
+        tags: [memberTag]
       })
     });
     const data = await r.json();
     if (!r.ok) {
-      console.error('Mailchimp error:', data.title, data.detail);
-      return res.status(502).json({ ok: false, error: data.title || 'Mailchimp error' });
+      console.error('Mailchimp error:', r.status, data.title, data.detail);
+      return { status: 502, body: { ok: false, error: data.title || 'Mailchimp error' } };
     }
-    // PUT upserts don't re-apply tags to already-existing members — set the tag explicitly
+
+    // A PUT upsert does NOT re-apply tags to members who already exist —
+    // set the tag explicitly so every submission is tagged.
     await fetch(url + '/tags', {
       method: 'POST',
-      headers: {
-        'Authorization': 'Basic ' + Buffer.from('anystring:' + apiKey).toString('base64'),
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify({ tags: [{ name: 'cfp entry', status: 'active' }] })
+      headers: { 'Authorization': auth, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ tags: [{ name: memberTag, status: 'active' }] })
     }).catch(err => console.warn('Tag call failed:', err.message));
 
-    return res.json({ ok: true });
+    console.log('Subscribed:', email, '| tag:', memberTag);
+    return { status: 200, body: { ok: true } };
   } catch (err) {
     console.error('Mailchimp request failed:', err.message);
-    return res.status(502).json({ ok: false, error: 'Mailchimp unreachable' });
+    return { status: 502, body: { ok: false, error: 'Mailchimp unreachable' } };
   }
+}
+
+const server = http.createServer((req, res) => {
+  const origin = req.headers.origin;
+  const { pathname } = new URL(req.url, `http://${req.headers.host}`);
+
+  // CORS preflight
+  if (req.method === 'OPTIONS') {
+    res.writeHead(204, corsHeaders(origin));
+    return res.end();
+  }
+
+  // Diagnostics — visiting the service URL in a browser confirms it's live
+  if (req.method === 'GET' && pathname === '/') {
+    return sendJSON(res, 200, {
+      service: 'hacktales-cfp-api',
+      status: 'running',
+      mailchimp_configured: Boolean(process.env.MAILCHIMP_API_KEY && process.env.MAILCHIMP_AUDIENCE_ID),
+      cors: allowedOrigins.length ? allowedOrigins : 'all origins (testing mode)'
+    }, origin);
+  }
+
+  // Warm-up ping (frontend calls this on page load to wake a sleeping instance)
+  if (req.method === 'GET' && pathname === '/health') {
+    return sendJSON(res, 200, { ok: true }, origin);
+  }
+
+  // The one real endpoint
+  if (req.method === 'POST' && pathname === '/api/subscribe') {
+    let raw = '';
+    req.on('data', chunk => {
+      raw += chunk;
+      if (raw.length > 1e5) req.destroy(); // guard against oversized bodies
+    });
+    req.on('end', async () => {
+      let payload = {};
+      try { payload = JSON.parse(raw || '{}'); }
+      catch { return sendJSON(res, 400, { ok: false, error: 'Invalid JSON' }, origin); }
+      const result = await subscribe(payload);
+      sendJSON(res, result.status, result.body, origin);
+    });
+    return;
+  }
+
+  sendJSON(res, 404, { ok: false, error: 'Not found' }, origin);
 });
 
 const port = process.env.PORT || 3000;
-app.listen(port, () => console.log(`CFP site running on :${port}`));
+server.listen(port, () => console.log(`hacktales-cfp-api listening on :${port}`));
