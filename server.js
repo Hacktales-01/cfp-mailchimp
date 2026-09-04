@@ -58,61 +58,56 @@ async function subscribe({ name, email, phone, tag }) {
   const url = `https://${dc}.api.mailchimp.com/3.0/lists/${listId}/members/${hash}`;
   const auth = 'Basic ' + Buffer.from('anystring:' + apiKey).toString('base64');
 
-  try {
+  // Normalise a Nigerian number to +234 international form, which Mailchimp's
+  // phone validators accept.  0803... -> +234803...,  234803... -> +234803...
+  let phoneClean = (phone || '').replace(/[^\d+]/g, '');
+  if (phoneClean.startsWith('00')) phoneClean = '+' + phoneClean.slice(2);
+  if (/^0\d{10}$/.test(phoneClean)) phoneClean = '+234' + phoneClean.slice(1);
+  else if (/^234\d{10}$/.test(phoneClean)) phoneClean = '+' + phoneClean;
+
+  // Helper: PUT the member with a given body, return {ok, data}
+  async function put(body) {
     const r = await fetch(url, {
       method: 'PUT',
       headers: { 'Authorization': auth, 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        email_address: email,
-        status_if_new: 'subscribed',
-        merge_fields: { FNAME: name || '', MMERGE2: phone || '' },
-        tags: [memberTag]
-      })
+      body: JSON.stringify(body)
     });
-    const data = await r.json();
-    if (!r.ok) {
-      // Mailchimp puts the exact offending field(s) in data.errors — log them.
-      console.error('Mailchimp error:', r.status, data.title, '|', data.detail);
-      if (Array.isArray(data.errors)) {
-        data.errors.forEach(e => console.error('  field:', e.field, '->', e.message));
-      }
-
-      // If the rejection is about a merge field (e.g. PHONE failing US-format
-      // validation for Nigerian numbers), retry WITHOUT merge fields so the
-      // subscriber + tag are still captured. Fix the field in Mailchimp to
-      // stop losing the phone number (see notes).
-      const isMergeIssue =
-        (data.title === 'Invalid Resource') &&
-        (Array.isArray(data.errors) ? data.errors.some(e => /merge|MMERGE2|FNAME/i.test(e.field || '')) : true);
-
-      if (isMergeIssue) {
-        const retry = await fetch(url, {
-          method: 'PUT',
-          headers: { 'Authorization': auth, 'Content-Type': 'application/json' },
-          body: JSON.stringify({ email_address: email, status_if_new: 'subscribed', tags: [memberTag] })
-        });
-        if (retry.ok) {
-          await fetch(url + '/tags', {
-            method: 'POST',
-            headers: { 'Authorization': auth, 'Content-Type': 'application/json' },
-            body: JSON.stringify({ tags: [{ name: memberTag, status: 'active' }] })
-          }).catch(() => {});
-          console.warn('Saved WITHOUT merge fields (phone/name dropped) — fix the PHONE field in Mailchimp. Email:', email);
-          return { status: 200, body: { ok: true, warning: 'saved without phone' } };
-        }
-      }
-
-      return { status: 502, body: { ok: false, error: data.title || 'Mailchimp error' } };
-    }
-
-    // A PUT upsert does NOT re-apply tags to members who already exist —
-    // set the tag explicitly so every submission is tagged.
+    let data = {};
+    try { data = await r.json(); } catch {}
+    return { ok: r.ok, status: r.status, data };
+  }
+  async function applyTag() {
     await fetch(url + '/tags', {
       method: 'POST',
       headers: { 'Authorization': auth, 'Content-Type': 'application/json' },
       body: JSON.stringify({ tags: [{ name: memberTag, status: 'active' }] })
     }).catch(err => console.warn('Tag call failed:', err.message));
+  }
 
+  const base = { email_address: email, status_if_new: 'subscribed', tags: [memberTag] };
+
+  try {
+    // Attempt 1: full record with name + phone
+    let res = await put({ ...base, merge_fields: { FNAME: name || '', MMERGE2: phone || '', COUNTRY: '-' } });
+
+    // Attempt 2: if rejected, log why and retry WITHOUT merge fields so the
+    // lead + tag are never lost (fix the field in Mailchimp to keep the phone).
+    if (!res.ok) {
+      console.error('Mailchimp error:', res.status, res.data.title, '|', res.data.detail);
+      if (Array.isArray(res.data.errors)) {
+        res.data.errors.forEach(e => console.error('  field:', e.field, '->', e.message));
+      }
+      res = await put({ ...base, merge_fields: { COUNTRY: '-' } });
+      if (res.ok) {
+        await applyTag();
+        console.warn('Saved WITHOUT merge fields (phone/name dropped). Fix the MMERGE2 field type in Mailchimp. Email:', email);
+        return { status: 200, body: { ok: true, warning: 'saved without merge fields' } };
+      }
+      console.error('Mailchimp error (retry):', res.status, res.data.title, '|', res.data.detail);
+      return { status: 502, body: { ok: false, error: res.data.title || 'Mailchimp error' } };
+    }
+
+    await applyTag();
     console.log('Subscribed:', email, '| tag:', memberTag);
     return { status: 200, body: { ok: true } };
   } catch (err) {
