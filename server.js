@@ -88,7 +88,7 @@ async function subscribe({ name, email, phone, tag }) {
 
   try {
     // Attempt 1: full record with name + phone
-    let res = await put({ ...base, merge_fields: { FNAME: name || '', MMERGE2: phone || '', COUNTRY: '-' } });
+    let res = await put({ ...base, merge_fields: { FNAME: name || '', MMERGE2: phone || '', COUNTRY: 'Nigeria' } });
 
     // Attempt 2: if rejected, log why and retry WITHOUT merge fields so the
     // lead + tag are never lost (fix the field in Mailchimp to keep the phone).
@@ -97,7 +97,7 @@ async function subscribe({ name, email, phone, tag }) {
       if (Array.isArray(res.data.errors)) {
         res.data.errors.forEach(e => console.error('  field:', e.field, '->', e.message));
       }
-      res = await put({ ...base, merge_fields: { COUNTRY: '-' } });
+      res = await put({ ...base, merge_fields: { COUNTRY: 'Nigeria' } });
       if (res.ok) {
         await applyTag();
         console.warn('Saved WITHOUT merge fields (phone/name dropped). Fix the MMERGE2 field type in Mailchimp. Email:', email);
