@@ -12,7 +12,7 @@ app.use(express.json());
 // ---- CORS: allow the cPanel-hosted frontend to call this API ----
 // Set ALLOWED_ORIGINS in Render env as a comma-separated list, e.g.:
 //   https://hacktales.com,https://www.hacktales.com,https://cfp.hacktales.com
-const allowed = (process.env.ALLOWED_ORIGINS || '')
+const allowed = (process.env.ALLOWED_ORIGINS || 'https://hacktales.com', 'https://www.hacktales.com')
   .split(',').map(s => s.trim()).filter(Boolean);
 
 app.use((req, res, next) => {
